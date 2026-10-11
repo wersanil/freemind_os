@@ -10,11 +10,15 @@ import time
 import shutil
 import subprocess
 import platform
+import ast
+import operator
+import shlex
+import stat as stat_mod
 from datetime import datetime
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 NAME = "FreeMind"
 
 COLORS = {
@@ -75,11 +79,42 @@ LOGO_ASCII = [
     "           |",
 ]
 
+_CALC_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+def _safe_eval(node):
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("only numbers allowed")
+    if isinstance(node, ast.BinOp):
+        op = _CALC_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError(f"operator not allowed: {type(node.op).__name__}")
+        return op(_safe_eval(node.left), _safe_eval(node.right))
+    if isinstance(node, ast.UnaryOp):
+        op = _CALC_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError(f"operator not allowed: {type(node.op).__name__}")
+        return op(_safe_eval(node.operand))
+    raise ValueError(f"expression not allowed: {type(node).__name__}")
 
 class FreeMind:
     """Main shell class."""
 
-    def __init__(self):
+    def __init__(self, readline_ok=True):
+        self.readline_ok = readline_ok
         self.running = True
         self.current_dir = os.path.expanduser("~") or "/"
         try:
@@ -89,6 +124,8 @@ class FreeMind:
         self.has_terminal = sys.stdout.isatty()
         self.use_unicode = os.environ.get('TERM', '') != 'linux'
         self.session_log = []   # (timestamp, command)
+        self.last_exit_code = 0
+
         self.commands = {}
         self.init_commands()
 
@@ -230,7 +267,10 @@ class FreeMind:
         self.clear_screen()
         print(f"{self.colorize(NAME + ' ' + VERSION, 'cyan')}  "
               f"{self.colorize('\"Freedom. Simplicity. Control\"', 'grey')}")
-        print(f"{self.colorize('help - list of commands, Shift+PgUp/PgDn - scroll', 'grey')}\n")
+        print(f"{self.colorize('help - list of commands, Shift+PgUp/PgDn - scroll', 'grey')}")
+        if not self.readline_ok:
+            print(self.colorize('(readline unavailable: history via "history" command only)', 'yellow'))
+        print()
         self.main_loop()
 
     def main_loop(self):
@@ -250,7 +290,19 @@ class FreeMind:
             self.execute_command(line)
 
     def execute_command(self, line):
-        parts = line.split()
+        # Shell metacharacters -> delegate to /bin/sh (native parser in 0.6)
+        shell_meta = ('|', '>', '<', '&', ';', '$', '`', '*', '?', '[', '~')
+        if any(c in line for c in shell_meta):
+            self.execute_system_command(line)
+            return
+
+        try:
+            parts = shlex.split(line)
+        except ValueError as e:
+            print(self.colorize(f"parse error: {e}", 'red'))
+            return
+        if not parts:
+            return
         cmd = parts[0].lower()
         args = parts[1:]
 
@@ -266,11 +318,14 @@ class FreeMind:
 
     def execute_system_command(self, command):
         try:
-            subprocess.run(command, shell=True)
+            result = subprocess.run(command, shell=True)
+            self.last_exit_code = result.returncode
         except FileNotFoundError:
             print(self.colorize(f"command not found: {command}", 'red'))
+            self.last_exit_code = 127
         except Exception as e:
             print(self.colorize(f"error: {e}", 'red'))
+            self.last_exit_code = 1
 
     # ────────────────────────────────────────────────────────────
     #  Control
@@ -303,7 +358,7 @@ class FreeMind:
 
     def cmd_exit(self, args):
         """Exit miniarch (BusyBox init will respawn)"""
-        print(self.colorize("Exiting...", 'grey'))
+        print(self.colorize("Shell will restart (inittab respawn). Use 'shutdown' to power off.", 'yellow'))
         self.running = False
 
     def cmd_reboot(self, args):
@@ -370,6 +425,8 @@ class FreeMind:
             rows = os.get_terminal_size().lines
         except OSError:
             rows = 24
+        if not rows or rows < 5:
+            rows = 24
         page = max(rows - 2, 5)
         i = 0
         while i < len(lines):
@@ -392,12 +449,18 @@ class FreeMind:
     # ────────────────────────────────────────────────────────────
 
     def cmd_ls(self, args):
-        """List files and directories"""
+        """List files and directories (ls [-a] [-l] [path])"""
         path = self.current_dir
         show_all = False
+        long_fmt = False
         for a in args:
             if a in ('-a', '/a', '--all'):
                 show_all = True
+            elif a in ('-l', '/l', '--long'):
+                long_fmt = True
+            elif a in ('-la', '-al', '/la', '/al'):
+                show_all = True
+                long_fmt = True
             else:
                 path = a
         try:
@@ -410,12 +473,27 @@ class FreeMind:
         items.sort(key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
         for item in items:
             full = os.path.join(path, item)
-            if os.path.isdir(full):
-                print(self.colorize(item + "/", 'blue'))
-            elif os.access(full, os.X_OK):
-                print(self.colorize(item + "*", 'green'))
+            if long_fmt:
+                try:
+                    st = os.lstat(full)
+                    mode = stat_mod.filemode(st.st_mode)
+                    mtime = datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
+                    if os.path.isdir(full):
+                        name = self.colorize(item + "/", 'blue')
+                    elif st.st_mode & 0o111:
+                        name = self.colorize(item + "*", 'green')
+                    else:
+                        name = item
+                    print(f"{mode} {st.st_size:>8} {mtime}  {name}")
+                except Exception:
+                    print(item)
             else:
-                print(item)
+                if os.path.isdir(full):
+                    print(self.colorize(item + "/", 'blue'))
+                elif os.access(full, os.X_OK):
+                    print(self.colorize(item + "*", 'green'))
+                else:
+                    print(item)
 
     def cmd_pwd(self, args):
         """Print working directory"""
@@ -482,11 +560,12 @@ class FreeMind:
                 print(self.colorize(f"touch: {fn}: {e}", 'red'))
 
     def cmd_cp(self, args):
-        """Copy a file or directory"""
-        if len(args) < 2:
-            print("Usage: cp <src> <dst>")
+        """Copy a file or directory (cp [-r] <src> <dst>)"""
+        files = [a for a in args if not a.startswith('-')]
+        if len(files) < 2:
+            print("Usage: cp [-r] <src> <dst>")
             return
-        src, dst = args[0], args[1]
+        src, dst = files[0], files[1]
         try:
             if os.path.isdir(src):
                 if os.path.isdir(dst):
@@ -498,12 +577,13 @@ class FreeMind:
             print(self.colorize(f"cp: {e}", 'red'))
 
     def cmd_mv(self, args):
-        """Move / rename"""
-        if len(args) < 2:
+        """Move / rename (mv <src> <dst>)"""
+        files = [a for a in args if not a.startswith('-')]
+        if len(files) < 2:
             print("Usage: mv <src> <dst>")
             return
         try:
-            shutil.move(args[0], args[1])
+            shutil.move(files[0], files[1])
         except Exception as e:
             print(self.colorize(f"mv: {e}", 'red'))
 
@@ -513,12 +593,15 @@ class FreeMind:
         files = []
         i = 0
         while i < len(args):
-            if args[i] in ('-n', '-') and i + 1 < len(args):
+            a = args[i]
+            if a in ('-n', '-') and i + 1 < len(args):
                 try:
                     n = int(args[i + 1]); i += 2; continue
                 except ValueError:
                     pass
-            files.append(args[i]); i += 1
+            elif a.startswith('-') and a[1:].isdigit():
+                n = int(a[1:]); i += 1; continue
+            files.append(a); i += 1
         if not files:
             print("Usage: head [-n N] <file>...")
             return
@@ -539,12 +622,15 @@ class FreeMind:
         files = []
         i = 0
         while i < len(args):
-            if args[i] in ('-n', '-') and i + 1 < len(args):
+            a = args[i]
+            if a in ('-n', '-') and i + 1 < len(args):
                 try:
                     n = int(args[i + 1]); i += 2; continue
                 except ValueError:
                     pass
-            files.append(args[i]); i += 1
+            elif a.startswith('-') and a[1:].isdigit():
+                n = int(a[1:]); i += 1; continue
+            files.append(a); i += 1
         if not files:
             print("Usage: tail [-n N] <file>...")
             return
@@ -751,14 +837,29 @@ class FreeMind:
     # ────────────────────────────────────────────────────────────
 
     def cmd_date(self, args):
-        """Show date and time"""
+        """Show date and time (date [+FORMAT])"""
         now = datetime.now()
+        if args and args[0].startswith('+'):
+            try:
+                print(now.strftime(args[0][1:]))
+            except Exception as e:
+                print(self.colorize(f"date: {e}", 'red'))
+            return
         print(f"{self.colorize('Date:', 'yellow')} {now.strftime('%Y-%m-%d')}")
         print(f"{self.colorize('Time:', 'yellow')} {now.strftime('%H:%M:%S')}")
 
     def cmd_echo(self, args):
-        """Print text"""
-        print(' '.join(args))
+        """Print text (echo [-n] ...)"""
+        no_newline = False
+        if args and args[0] == '-n':
+            no_newline = True
+            args = args[1:]
+        out = ' '.join(args)
+        if no_newline:
+            sys.stdout.write(out)
+            sys.stdout.flush()
+        else:
+            print(out)
 
     def cmd_whoami(self, args):
         """Print current user name"""
@@ -898,25 +999,30 @@ class FreeMind:
             if expr.lower() in ('q', 'quit', 'exit'):
                 break
             if not all(c in allowed for c in expr):
-                print(self.colorize("Only digits and + - * / ( ) .", 'red'))
+                print(self.colorize("Only digits and + - * / ( ) . %", 'red'))
                 continue
             try:
-                print(f"= {eval(expr, {'__builtins__': {}}, {})}")
+                tree = ast.parse(expr, mode='eval')
+                result = _safe_eval(tree)
+                print(f"= {result}")
             except Exception as e:
                 print(self.colorize(f"error: {e}", 'red'))
 
     def cmd_calcfig(self, args):
-        """Rectangle area and perimeter (text output)"""
+        """Rectangle area and perimeter (text output, float ok)"""
+        def _fmt(x):
+            return str(int(x)) if x == int(x) else f"{x:.2f}"
+
         try:
             if len(args) >= 2:
-                length = int(args[0])
-                width = int(args[1])
+                length = float(args[0])
+                width = float(args[1])
             else:
                 print("Enter rectangle sides:")
-                length = int(input("  Length: "))
-                width = int(input("  Width:  "))
+                length = float(input("  Length: "))
+                width = float(input("  Width:  "))
         except (ValueError, EOFError, KeyboardInterrupt):
-            print(self.colorize("Error: an integer is required.", 'red'))
+            print(self.colorize("Error: a number is required.", 'red'))
             return
 
         area = length * width
@@ -924,9 +1030,9 @@ class FreeMind:
 
         c = self.colorize
         print()
-        print(f"  {c('Sides', 'cyan')}      : {length} x {width}")
-        print(f"  {c('Perimeter', 'cyan')}  : {perim}")
-        print(f"  {c('Area', 'cyan')}       : {area}")
+        print(f"  {c('Sides', 'cyan')}      : {_fmt(length)} x {_fmt(width)}")
+        print(f"  {c('Perimeter', 'cyan')}  : {_fmt(perim)}")
+        print(f"  {c('Area', 'cyan')}       : {_fmt(area)}")
         print()
 
     # ────────────────────────────────────────────────────────────
@@ -977,7 +1083,6 @@ class FreeMind:
             print(f"{left}   {right}")
         print()
 
-
 # ────────────────────────────────────────────────────────────────
 #  Entry point
 # ────────────────────────────────────────────────────────────────
@@ -1006,10 +1111,9 @@ def _setup_readline():
     atexit.register(_save)
     return True
 
-
 def main():
-    _setup_readline()   # must run before the first input(), otherwise arrows won't work
-    shell = FreeMind()
+    rl_ok = _setup_readline()
+    shell = FreeMind(readline_ok=rl_ok)
     try:
         shell.boot()
     except KeyboardInterrupt:
@@ -1017,7 +1121,6 @@ def main():
     except Exception as e:
         print(f"critical: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
