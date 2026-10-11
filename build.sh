@@ -126,7 +126,15 @@ make ARCH="$KARCH" tinyconfig
     --enable  VIRTIO_BLK \
     --enable  VIRTIO_NET \
     --enable  E1000 \
+    --enable  E1000E \
+    --enable  R8169 \
+    --enable  IGB \
+    --enable  MII \
+    --enable  NET_VENDOR_INTEL \
+    --enable  NET_VENDOR_REALTEK \
     --enable  NET \
+    --enable  NETDEVICES \
+    --enable  NET_CORE \
     --enable  PACKET \
     --enable  UNIX \
     --enable  INET \
@@ -179,12 +187,17 @@ make ARCH="$KARCH" olddefconfig
 ./scripts/config --file .config --enable 64BIT
 ./scripts/config --file .config --enable BINFMT_ELF
 ./scripts/config --file .config --enable BINFMT_SCRIPT
+./scripts/config --file .config --enable NETDEVICES
+./scripts/config --file .config --enable E1000
+./scripts/config --file .config --enable VIRTIO_NET
+./scripts/config --file .config --enable R8169
 make ARCH="$KARCH" olddefconfig
 
 # Шаг 4: валидация конфига — падаем до сборки, если чего-то нет
 fail=0
 for opt in 64BIT BINFMT_ELF BINFMT_SCRIPT DEVTMPFS DEVTMPFS_MOUNT \
-           BLK_DEV_INITRD RD_GZIP TMPFS PROC_FS SYSFS; do
+           BLK_DEV_INITRD RD_GZIP TMPFS PROC_FS SYSFS \
+           NET NETDEVICES; do
     if ! grep -q "^CONFIG_${opt}=y" .config; then
         echo -e "${RED}❌ CONFIG_${opt} не включён в .config${NC}"
         fail=1
@@ -238,7 +251,8 @@ for cmd in sh ls cat vi grep sed awk ps top mount umount cp mv rm mkdir rmdir \
            uname hostname id whoami date sleep seq \
            chmod chown ln stat touch sync tar gzip gunzip \
            df du free uptime mknod mkfifo mountpoint \
-           setfont loadkmap; do
+           setfont loadkmap wget ntpdate ntpd nslookup \
+           arp traceroute telnet; do
     ln -sf /bin/busybox "bin/$cmd"
 done
 for cmd in reboot poweroff halt; do
@@ -389,6 +403,8 @@ mount -t tmpfs  tmpfs  /tmp     2>/dev/null
 [ -f /etc/consolefont.psf.gz ] && setfont -u /etc/consolefont.psf.gz 2>/dev/null
 
 export HOME=/home/user
+export USER=user
+export LOGNAME=user
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export TERM=linux
 export PYTHONDONTWRITEBYTECODE=1
@@ -410,6 +426,52 @@ for tty in ("/dev/tty0", "/dev/tty1", "/dev/console"):
         pass
 PYUTF8
 
+# --- udhcpc script: применяет lease к интерфейсу ---
+cat > /etc/udhcpc.script <<'UDHCPC_SCRIPT'
+#!/bin/sh
+case "$1" in
+    deconfig) ifconfig "$interface" 0.0.0.0 2>/dev/null ;;
+    bound|renew)
+        ifconfig "$interface" "$ip" netmask "$subnet" up
+        [ -n "$router" ] && route add default gw "$router" 2>/dev/null
+        if [ -n "$dns" ]; then
+            : > /etc/resolv.conf
+            for ns in $dns; do echo "nameserver $ns" >> /etc/resolv.conf; done
+        fi
+        ;;
+esac
+exit 0
+UDHCPC_SCRIPT
+chmod +x /etc/udhcpc.script
+
+for iface in eth0 enp0s3 enp0s8 ens3 ens33 enp1s0; do
+    if [ -d "/sys/class/net/$iface" ]; then
+        ifconfig "$iface" up 2>/dev/null
+        if udhcpc -i "$iface" -s /etc/udhcpc.script -q -n -t 3 -T 2 2>/dev/null; then
+            echo "[net] $iface up (DHCP)"
+            break
+        fi
+    fi
+done
+
+# Fallback DNS, если udhcpc не написал
+if [ ! -s /etc/resolv.conf ]; then
+    cat > /etc/resolv.conf <<DNS
+nameserver 77.88.8.8
+nameserver 8.8.8.8
+DNS
+fi
+
+# --- NTP: синхронизация времени (quit after setting) ---
+ntpd -q -n -p pool.ntp.org 2>/dev/null &
+NTP_PID=$!
+# ждём до 8 секунд, потом не блокируем загрузку
+for _ in 1 2 3; do
+    kill -0 $NTP_PID 2>/dev/null || break
+    sleep 1
+done
+kill $NTP_PID 2>/dev/null || true
+
 hostname freemind 2>/dev/null || true
 EOF
 chmod +x etc/init.d/rcS
@@ -417,6 +479,8 @@ chmod +x etc/init.d/rcS
 # --- Профиль и motd ---
 cat > etc/profile << 'EOF'
 export HOME=/home/user
+export USER=user
+export LOGNAME=user
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export TERM=linux
 export PYTHONDONTWRITEBYTECODE=1
